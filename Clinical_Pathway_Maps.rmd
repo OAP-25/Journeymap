@@ -1,0 +1,138 @@
+---
+title: "Clinical Pathway Maps"
+author: "Gallin Montgomery"
+date: "`r Sys.Date()`"
+output: html_document
+---
+# Big question, how do Alzheimer's patients move through the hospital system and what treatments are given?
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+pacman::p_load(rmarkdown, dplyr, knitr, tidyr, stringr, DBI, odbc, bupaverse, processanimateR)
+```
+
+```{r echo=FALSE}
+# Open your UDAL connection, this will require an NHS UDAL login in a separate pop up window
+con_udal <- DBI::dbConnect(drv = odbc::odbc(),
+                           driver = "ODBC Driver 17 for SQL Server",
+                           server = "udalsqlmartprod.database.windows.net",
+                           database = "udal-sql-mart-patactivity",
+ ====================>     UID = "###insert your email here###@udal.nhs.uk", # Edit your UDAL email here ######################################### <===================================================
+                           authentication = "ActiveDirectoryInteractive")
+
+# Read in the dbo.IP_All_Daily_Spells data for the previous year
+Inpatients_Daily <- DBI::dbGetQuery(conn = con_udal, statement = "
+SELECT 
+NCDR_ID,
+Hospital_Spell_No,
+Patient_ID,
+Age,
+Ethnic_Category,
+Decision_of_Refer_to_Service_Date,
+Attendance_Date,
+Discharge_Date,
+Length_of_Stay,
+Dimention_1,
+Dimention_2,
+Dimention_6,
+Dimention_7,
+Case When Len(Dimention_7) = 12 Then Left(Dimention_7, 5) Else  NULL End  As HRG_Code,
+Case When Len(Dimention_7) = 12 Then Right(Dimention_7, 4) Else  NULL End  As Primary_OPCS_L4_Code,
+Dimention_8,
+Case When Len(Dimention_8) >= 3 Then Left(Dimention_8, 4) Else  NULL End  As Primary_ICD,
+Case When Len(Dimention_8) >= 3 Then Substring(Dimention_8, 7, Len(Dimention_8)) Else  NULL End  As Secondary_ICD,
+Dimention_9,
+Case When Len(Dimention_9) >= 3 Then Substring(Dimention_9, 7, Len(Dimention_9)) Else  NULL End  As Secondary_OPCS_L4_Code,
+Referral_Source,
+Source_of_Admission,
+TFC,
+Discharge_To_Hospital_At_Home,
+Total_Activity,
+Total_Cost_Current,
+IMD_Rank,
+IMD_Decile,
+Date_of_Death
+FROM dbo.IP_All_Daily_Spells
+WHERE Discharge_Date Between DATEADD(week, -66, getdate()) And DATEADD(week, -14, getdate()) 
+AND
+Dimention_8 LIKE '%G30%'
+")
+
+# Filter data to get patients with an Alzheimer's ICD 10 code only. Remove duplicates.
+Alz_data <- Inpatients_Daily %>% 
+  filter(grepl("G30", Primary_ICD)) %>% 
+  distinct()
+```
+
+```{r echo=FALSE}
+# Select relevant variables
+Alz_data_process <- Alz_data %>% 
+  select(Patient_ID, Hospital_Spell_No, Primary_OPCS_L4_Code, Decision_of_Refer_to_Service_Date, Attendance_Date, Discharge_Date, Dimention_1, Dimention_6)
+
+# Clean variables
+Alz_data_process <- Alz_data_process %>% 
+  mutate(Patient_ID = as.character(Patient_ID))
+
+# Identify key milestones in the process with associated timestamps
+Alz_data_process2 <- Alz_data_process %>% 
+  pivot_longer(cols = c("Decision_of_Refer_to_Service_Date", "Attendance_Date", "Discharge_Date"), names_to = "milestone", values_to = "timestamp")
+
+Alz_data_process2 <- Alz_data_process2 %>% 
+  mutate(Stage = ifelse(milestone == "Decision_of_Refer_to_Service_Date", Dimention_1, ifelse(milestone == "Attendance_Date", Primary_OPCS_L4_Code, ifelse(milestone == "Discharge_Date", Dimention_6, milestone))))
+
+# Clean the erroneous timestamps
+Alz_data_process2 <- Alz_data_process2 %>% 
+  mutate_all(~ str_replace_all(., "1900-01-01", "")) 
+
+# Restructure data
+Alz_data_process2 <- Alz_data_process2 %>% 
+  mutate(timestamp2 = as.Date(timestamp)) %>% 
+  group_by(Patient_ID, Hospital_Spell_No) %>% 
+  arrange(Patient_ID, !is.na(timestamp2), timestamp2) %>% 
+  fill(timestamp2, .direction = "up")
+
+Alz_data_process2 <- Alz_data_process2 %>% 
+  ungroup() %>% 
+  mutate(activity_instance_id = row_number(),
+         lifecycle = "completed",
+         resource = "nhs_staff")
+
+# Read in OPCS Level 4 Code Descriptions to give a description of the treatment
+OPCS_L4_Code_Descriptions <- read.csv("OPCS_L4_Code_Descriptions.csv")
+
+# Clean OPCS Level 4 Descriptions
+OPCS_L4_Code_Descriptions <- OPCS_L4_Code_Descriptions %>%
+  mutate_all(~ str_replace_all(., "�", " ")) 
+
+OPCS_L4_Code_Descriptions <- OPCS_L4_Code_Descriptions %>%
+  rename(OPCS_L4_Code = OPCS_4.9,
+         OPCS_L4_Code_Description = Description) %>%
+  mutate(OPCS_L4_Code = sub("[.]", "", OPCS_L4_Code),
+         OPCS_L4_Code_Description = gsub(".*: ", "", OPCS_L4_Code_Description))
+
+# Merge OPCS Level 4 Descriptions with the Alzheimer's patient data
+Alz_data_process2 <- merge(Alz_data_process2, OPCS_L4_Code_Descriptions, by.x = "Primary_OPCS_L4_Code", by.y = "OPCS_L4_Code", all.x = TRUE)
+
+# Create stages in the pathway from OPC Level 4 Descriptions
+Alz_data_process2 <- Alz_data_process2 %>% 
+  mutate(Stage2 = ifelse(nchar(Stage) <= 4, OPCS_L4_Code_Description, Stage)) %>% 
+  arrange(activity_instance_id)
+
+# Align the dataframe with the correct event log variables
+Alz_data_process3 <- eventlog(Alz_data_process2, case_id = "Patient_ID", activity_id = "Stage2", activity_instance_id = "activity_instance_id", lifecycle_id = "lifecycle", timestamp = "timestamp2", resource_id = "resource")
+
+# Select the 80% most frequently taken patient pathways, this figure can be adjusted to suit
+Alz_process_80per <- Alz_data_process3 %>% 
+  filter_trace_frequency(percentage = 0.80)
+```
+
+```{r echo=FALSE}
+# Create the process map to visualise the patient journeys
+process_map(Alz_process_80per, frequency("relative-case"))
+
+# Create the process map to visualise the duration between each stage of the patient journeys
+process_map(Alz_process_80per, performance(median, "days"))
+
+# Create an animated version of the process map to visualise the patient journeys
+animate_process(Alz_process_80per)
+```
